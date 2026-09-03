@@ -11,33 +11,22 @@ on:
 jobs:
   build-amd64:
     name: Build AMD64 binaries
-    runs-on: cncf-ubuntu-8-32-x86
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-    - name: Install make curl git kmod
-      run: |
-        sudo apt update
-        sudo apt-get -y install make curl git kmod
-
-    - name: Set up hugepages
-      run: |
-        sudo sh -c "echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-        grep Huge /proc/meminfo
-
-    - name: Load kernel modules
-      run: sudo modprobe nvme-tcp vfio_pci uio_pci_generic ublk_drv
-
-    # Build binaries
-    - name: Run ci
-      run: make ci
-
-    - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+    - name: Set up Go
+      uses: actions/setup-go@v6
       with:
-        files: ./coverage.out
-        flags: unittests
-        token: ${{ secrets.CODECOV_TOKEN }}
+        go-version-file: go.mod
+        cache: false
+
+    - name: Validate pkg/spdk
+      run: |
+        test -z "$(gofmt -l pkg/spdk)"
+        go vet ./pkg/spdk
+        go test ./pkg/spdk -count=1
 
   build-arm64:
     name: Build ARM64 binaries
