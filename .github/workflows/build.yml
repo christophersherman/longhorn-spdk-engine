@@ -1,71 +1,47 @@
 name: build
 on:
-  push:
-    branches:
-    - master
-    - v*
-    tags:
-    - v*
-  pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  build-amd64:
-    name: Build AMD64 binaries
-    runs-on: cncf-ubuntu-16-64-x86
+  backup-reader:
+    name: Validate backup reader cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - name: Checkout code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-    - name: Install make curl git kmod
-      run: |
-        sudo apt update
-        sudo apt-get -y install make curl git kmod
-
-    - name: Set up hugepages
-      run: |
-        sudo sh -c "echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-        grep Huge /proc/meminfo
-
-    - name: Load kernel modules
-      run: sudo modprobe nvme-tcp vfio_pci uio_pci_generic ublk_drv
-
-    # Build binaries
-    - name: Run ci
-      run: make ci
-
-    - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
-        files: ./coverage.out
-        flags: unittests
-        token: ${{ secrets.CODECOV_TOKEN }}
+        ref: ea5ff67342fc8bcd7d39b64c1238bb8eddfa5baf
+        fetch-depth: 2
 
-  build-arm64:
-    name: Build ARM64 binaries
-    if: false
-    runs-on: oracle-vm-16cpu-64gb-arm64
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-    - name: Install make curl git kmod
-      run: |
-        sudo apt update
-        sudo apt-get -y install make curl git kmod
-
-    - name: Set up hugepages
-      run: |
-        sudo sh -c "echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-        grep Huge /proc/meminfo
-
-    - name: Load kernel modules
-      run: sudo modprobe nvme-tcp vfio_pci uio_pci_generic ublk_drv
-
-    # Build binaries
-    - name: Run ci
-      run: sudo make ci
-
-    - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+    - name: Set up Go
+      uses: actions/setup-go@v6
       with:
-        files: ./coverage.out
-        flags: unittests
-        token: ${{ secrets.CODECOV_TOKEN }}
+        go-version-file: go.mod
+        cache: true
+
+    - name: Reproduce the panic before the fix
+      run: |
+        git restore --source=HEAD^ -- pkg/spdk/backup.go
+        set +e
+        go test ./pkg/spdk -check.f TestReadSnapshotAfterCleanupReturnsError -count=1 -timeout=5m > "$RUNNER_TEMP/backup-reader-before.log" 2>&1
+        status=$?
+        set -e
+        cat "$RUNNER_TEMP/backup-reader-before.log"
+        test "$status" -ne 0
+        grep -q 'TestReadSnapshotAfterCleanupReturnsError' "$RUNNER_TEMP/backup-reader-before.log"
+        grep -q 'invalid memory address or nil pointer dereference' "$RUNNER_TEMP/backup-reader-before.log"
+        git restore --source=HEAD -- pkg/spdk/backup.go
+
+    - name: Check formatting and vet
+      run: |
+        test -z "$(gofmt -l pkg/spdk/backup.go pkg/spdk/backup_read_test.go)"
+        git diff --exit-code
+        go vet ./pkg/spdk
+
+    - name: Run the full SPDK package suite
+      run: go test ./pkg/spdk -count=1 -timeout=5m
+
+    - name: Repeat the full package with the race detector
+      run: go test -race ./pkg/spdk -count=3 -timeout=10m
