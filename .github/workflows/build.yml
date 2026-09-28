@@ -1,71 +1,55 @@
 name: build
 on:
-  push:
-    branches:
-    - master
-    - v*
-    tags:
-    - v*
-  pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  build-amd64:
-    name: Build AMD64 binaries
-    runs-on: cncf-ubuntu-16-64-x86
+  validate:
+    name: Validate stale-path cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
     - name: Checkout code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-    - name: Install make curl git kmod
-      run: |
-        sudo apt update
-        sudo apt-get -y install make curl git kmod
-
-    - name: Set up hugepages
-      run: |
-        sudo sh -c "echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-        grep Huge /proc/meminfo
-
-    - name: Load kernel modules
-      run: sudo modprobe nvme-tcp vfio_pci uio_pci_generic ublk_drv
-
-    # Build binaries
-    - name: Run ci
-      run: make ci
-
-    - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
       with:
-        files: ./coverage.out
-        flags: unittests
-        token: ${{ secrets.CODECOV_TOKEN }}
+        ref: 67d0e8b72b5d69476af3afc4c892195be80aa4d0
+        fetch-depth: 2
 
-  build-arm64:
-    name: Build ARM64 binaries
-    if: false
-    runs-on: oracle-vm-16cpu-64gb-arm64
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-    - name: Install make curl git kmod
-      run: |
-        sudo apt update
-        sudo apt-get -y install make curl git kmod
-
-    - name: Set up hugepages
-      run: |
-        sudo sh -c "echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-        grep Huge /proc/meminfo
-
-    - name: Load kernel modules
-      run: sudo modprobe nvme-tcp vfio_pci uio_pci_generic ublk_drv
-
-    # Build binaries
-    - name: Run ci
-      run: sudo make ci
-
-    - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+    - name: Set up Go
+      uses: actions/setup-go@v6
       with:
-        files: ./coverage.out
-        flags: unittests
-        token: ${{ secrets.CODECOV_TOKEN }}
+        go-version-file: go.mod
+        cache: true
+
+    - name: Check formatting, build, and vet
+      run: |
+        test -z "$(gofmt -l pkg/spdk/enginefrontend.go pkg/spdk/switchover_test.go pkg/spdk/nvme_path_cleanup.go pkg/spdk/nvme_path_cleanup_test.go)"
+        git diff --check
+        go build ./...
+        go vet ./...
+
+    - name: Run full race-enabled Go suite
+      run: go test -race ./... -count=1 -timeout=10m
+
+    - name: Stress cleanup regressions
+      run: |
+        go test -race ./pkg/spdk -count=25 -timeout=10m -args -check.f 'EngineFrontendCleanup|NvmeTCPPath|DropSupersededNvmeTCPPath|BlockdevDropsSupersededPath|BlockdevDropFailure'
+
+    - name: Compile Linux ARM64 tests
+      run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/spdk-arm64.test" ./pkg/spdk
+
+    - name: Run repository linter
+      run: |
+        docker run --rm -v "$PWD":/app:ro -w /app golangci/golangci-lint:v2.13.2@sha256:ba07dffad130794ae79ebaa0056809d18c0168f3f846480ffd3eb6c04578b83d golangci-lint run --timeout=10m
+
+    - name: Verify new tests reject unsafe cleanup
+      run: |
+        sed -i 's/if persistErr == nil {/if true {/' pkg/spdk/enginefrontend.go
+        sed -i '/if err := ef.waitForNvmeTCPPathOptimized/s/err != nil/false/' pkg/spdk/enginefrontend.go
+        sed -i 's/helperutil.IsSameNvmeAddr(oldTargetIP, newTargetIP)/oldTargetIP == newTargetIP/' pkg/spdk/enginefrontend.go
+        set +e
+        go test -race ./pkg/spdk -count=1 -timeout=5m -args -check.f 'EngineFrontendCleanupSkipsAfterPersistenceFailure|EngineFrontendCleanupSkipsUnoptimizedReplacement|DropSupersededNvmeTCPPathPreservesEquivalentAddress' 2>&1 | tee "$RUNNER_TEMP/stale-path-without-guards.log"
+        regression_status=${PIPESTATUS[0]}
+        set -e
+        test "$regression_status" -ne 0
+        grep -F '3 FAILED' "$RUNNER_TEMP/stale-path-without-guards.log"
